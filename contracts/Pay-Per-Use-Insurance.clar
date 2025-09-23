@@ -8,6 +8,7 @@
 (define-constant ERR-POLICY-EXPIRED (err u1006))
 (define-constant ERR-INVALID-CLAIM (err u1007))
 (define-constant ERR-ORACLE-NOT-AUTHORIZED (err u1008))
+(define-constant ERR-RISK-PROFILE-NOT-FOUND (err u1009))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-policy-id uint u1)
@@ -43,6 +44,22 @@
 )
 
 (define-map authorized-oracles principal bool)
+
+(define-map user-risk-profiles
+  { user: principal }
+  {
+    base-risk-score: uint,
+    total-policies: uint,
+    total-claims: uint,
+    approved-claims: uint,
+    rejected-claims: uint,
+    total-premiums-paid: uint,
+    last-claim-block: uint,
+    payment-reliability: uint,
+    claim-frequency: uint,
+    last-updated: uint
+  }
+)
 
 (define-data-var next-claim-id uint u1)
 
@@ -100,6 +117,8 @@
     
     (var-set next-policy-id (+ policy-id u1))
     (var-set total-premiums (+ (var-get total-premiums) premium))
+    
+    (update-risk-profile-on-policy tx-sender premium)
     
     (ok policy-id)
   )
@@ -159,10 +178,14 @@
           { claim-id: claim-id }
           (merge claim { status: "approved", processed-block: (some current-block) })
         )
+        (update-risk-profile-on-claim (get claimant claim) true)
       )
-      (map-set claims
-        { claim-id: claim-id }
-        (merge claim { status: "rejected", processed-block: (some current-block) })
+      (begin
+        (map-set claims
+          { claim-id: claim-id }
+          (merge claim { status: "rejected", processed-block: (some current-block) })
+        )
+        (update-risk-profile-on-claim (get claimant claim) false)
       )
     )
     
@@ -212,6 +235,84 @@
     (var-set total-premiums (+ (var-get total-premiums) extension-fee))
     
     (ok (get end-block (merge policy { end-block: (+ (get end-block policy) additional-duration) })))
+  )
+)
+
+(define-private (update-risk-profile-on-policy (user principal) (premium uint))
+  (let
+    (
+      (current-profile (default-to
+        {
+          base-risk-score: u100,
+          total-policies: u0,
+          total-claims: u0,
+          approved-claims: u0,
+          rejected-claims: u0,
+          total-premiums-paid: u0,
+          last-claim-block: u0,
+          payment-reliability: u100,
+          claim-frequency: u0,
+          last-updated: stacks-block-height
+        }
+        (map-get? user-risk-profiles { user: user })
+      ))
+    )
+    (map-set user-risk-profiles
+      { user: user }
+      (merge current-profile {
+        total-policies: (+ (get total-policies current-profile) u1),
+        total-premiums-paid: (+ (get total-premiums-paid current-profile) premium),
+        last-updated: stacks-block-height
+      })
+    )
+  )
+)
+
+(define-private (update-risk-profile-on-claim (user principal) (approved bool))
+  (let
+    (
+      (current-profile (unwrap-panic (map-get? user-risk-profiles { user: user })))
+      (new-total-claims (+ (get total-claims current-profile) u1))
+      (new-approved-claims (if approved (+ (get approved-claims current-profile) u1) (get approved-claims current-profile)))
+      (new-rejected-claims (if approved (get rejected-claims current-profile) (+ (get rejected-claims current-profile) u1)))
+      (claim-rate (if (> new-total-claims u0) (/ (* new-approved-claims u100) new-total-claims) u0))
+      (blocks-since-last-claim (- stacks-block-height (get last-claim-block current-profile)))
+      (frequency-score (if (and (> (get last-claim-block current-profile) u0) (< blocks-since-last-claim u1440)) u150 u100))
+    )
+    (map-set user-risk-profiles
+      { user: user }
+      (merge current-profile {
+        total-claims: new-total-claims,
+        approved-claims: new-approved-claims,
+        rejected-claims: new-rejected-claims,
+        last-claim-block: stacks-block-height,
+        claim-frequency: frequency-score,
+        last-updated: stacks-block-height
+      })
+    )
+  )
+)
+
+(define-read-only (calculate-dynamic-risk-score (user principal))
+  (match (map-get? user-risk-profiles { user: user })
+    profile (let
+      (
+        (base-score (get base-risk-score profile))
+        (total-claims (get total-claims profile))
+        (approved-claims (get approved-claims profile))
+        (claim-rate (if (> total-claims u0) (/ (* approved-claims u100) total-claims) u0))
+        (frequency-multiplier (get claim-frequency profile))
+        (reliability-score (get payment-reliability profile))
+        
+        (claim-penalty (if (> claim-rate u20) (+ u50 (* (- claim-rate u20) u2)) u0))
+        (frequency-penalty (if (> frequency-multiplier u100) (- frequency-multiplier u100) u0))
+        (reliability-bonus (if (> reliability-score u90) (- u100 reliability-score) u0))
+        
+        (adjusted-score (+ base-score claim-penalty frequency-penalty (- reliability-bonus)))
+      )
+      (if (> adjusted-score u300) u300 (if (< adjusted-score u50) u50 adjusted-score))
+    )
+    u100
   )
 )
 
@@ -265,10 +366,57 @@
   )
 )
 
+(define-read-only (calculate-personalized-premium (user principal) (coverage-amount uint) (duration uint))
+  (let
+    (
+      (base-rate u100)
+      (duration-multiplier (/ duration u144))
+      (dynamic-risk-score (calculate-dynamic-risk-score user))
+    )
+    (/ (* (* coverage-amount base-rate) duration-multiplier dynamic-risk-score) u1000000)
+  )
+)
+
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
 )
 
 (define-read-only (is-authorized-oracle (oracle principal))
   (default-to false (map-get? authorized-oracles oracle))
+)
+
+(define-read-only (get-user-risk-profile (user principal))
+  (map-get? user-risk-profiles { user: user })
+)
+
+(define-read-only (get-user-risk-score (user principal))
+  (calculate-dynamic-risk-score user)
+)
+
+(define-read-only (get-risk-tier (user principal))
+  (let
+    (
+      (risk-score (calculate-dynamic-risk-score user))
+    )
+    (if (<= risk-score u75)
+      "low-risk"
+      (if (<= risk-score u125)
+        "medium-risk"
+        "high-risk"
+      )
+    )
+  )
+)
+
+(define-read-only (calculate-premium-discount (user principal))
+  (let
+    (
+      (risk-score (calculate-dynamic-risk-score user))
+      (base-score u100)
+    )
+    (if (< risk-score base-score)
+      (- base-score risk-score)
+      u0
+    )
+  )
 )
