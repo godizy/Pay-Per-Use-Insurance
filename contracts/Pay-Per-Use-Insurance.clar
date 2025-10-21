@@ -9,6 +9,10 @@
 (define-constant ERR-INVALID-CLAIM (err u1007))
 (define-constant ERR-ORACLE-NOT-AUTHORIZED (err u1008))
 (define-constant ERR-RISK-PROFILE-NOT-FOUND (err u1009))
+(define-constant ERR-BUNDLE-NOT-FOUND (err u1010))
+(define-constant ERR-BUNDLE-ALREADY-EXISTS (err u1011))
+(define-constant ERR-INVALID-BUNDLE (err u1012))
+(define-constant ERR-MAX-POLICIES-REACHED (err u1013))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-policy-id uint u1)
@@ -61,7 +65,27 @@
   }
 )
 
+(define-map policy-bundles
+  { bundle-id: uint }
+  {
+    owner: principal,
+    policy-ids: (list 10 uint),
+    total-premium: uint,
+    total-coverage: uint,
+    bundle-discount: uint,
+    created-block: uint,
+    active: bool,
+    bundle-name: (string-ascii 100)
+  }
+)
+
+(define-map user-bundles
+  { user: principal }
+  { bundle-ids: (list 20 uint) }
+)
+
 (define-data-var next-claim-id uint u1)
+(define-data-var next-bundle-id uint u1)
 
 (define-public (set-contract-owner (new-owner principal))
   (begin
@@ -418,5 +442,186 @@
       (- base-score risk-score)
       u0
     )
+  )
+)
+
+(define-public (create-policy-bundle
+  (policy-ids (list 10 uint))
+  (bundle-name (string-ascii 100)))
+  (let
+    (
+      (bundle-id (var-get next-bundle-id))
+      (current-block stacks-block-height)
+      (num-policies (len policy-ids))
+    )
+    (asserts! (> num-policies u1) ERR-INVALID-BUNDLE)
+    (asserts! (<= num-policies u10) ERR-MAX-POLICIES-REACHED)
+    (asserts! (validate-bundle-ownership tx-sender policy-ids) ERR-NOT-AUTHORIZED)
+    (asserts! (validate-bundle-policies policy-ids) ERR-INVALID-POLICY)
+    
+    (let
+      (
+        (bundle-stats (calculate-bundle-stats policy-ids))
+        (discount-percent (calculate-bundle-discount num-policies))
+        (discount-amount (/ (* (get total-premium bundle-stats) discount-percent) u100))
+      )
+      (map-set policy-bundles
+        { bundle-id: bundle-id }
+        {
+          owner: tx-sender,
+          policy-ids: policy-ids,
+          total-premium: (get total-premium bundle-stats),
+          total-coverage: (get total-coverage bundle-stats),
+          bundle-discount: discount-amount,
+          created-block: current-block,
+          active: true,
+          bundle-name: bundle-name
+        }
+      )
+      
+      (update-user-bundles tx-sender bundle-id)
+      (var-set next-bundle-id (+ bundle-id u1))
+      
+      (ok bundle-id)
+    )
+  )
+)
+
+(define-public (deactivate-bundle (bundle-id uint))
+  (let
+    (
+      (bundle (unwrap! (map-get? policy-bundles { bundle-id: bundle-id }) ERR-BUNDLE-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner bundle)) ERR-NOT-AUTHORIZED)
+    (asserts! (get active bundle) ERR-INVALID-BUNDLE)
+    
+    (map-set policy-bundles
+      { bundle-id: bundle-id }
+      (merge bundle { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (validate-bundle-ownership (owner principal) (policy-ids (list 10 uint)))
+  (fold check-policy-owner policy-ids true)
+)
+
+(define-private (check-policy-owner (policy-id uint) (valid bool))
+  (if valid
+    (match (map-get? policies { policy-id: policy-id })
+      policy (is-eq tx-sender (get insured policy))
+      false
+    )
+    false
+  )
+)
+
+(define-private (validate-bundle-policies (policy-ids (list 10 uint)))
+  (fold check-policy-active policy-ids true)
+)
+
+(define-private (check-policy-active (policy-id uint) (valid bool))
+  (if valid
+    (match (map-get? policies { policy-id: policy-id })
+      policy (get active policy)
+      false
+    )
+    false
+  )
+)
+
+(define-private (calculate-bundle-stats (policy-ids (list 10 uint)))
+  (fold accumulate-policy-stats policy-ids { total-premium: u0, total-coverage: u0 })
+)
+
+(define-private (accumulate-policy-stats (policy-id uint) (stats { total-premium: uint, total-coverage: uint }))
+  (match (map-get? policies { policy-id: policy-id })
+    policy
+      {
+        total-premium: (+ (get total-premium stats) (get premium policy)),
+        total-coverage: (+ (get total-coverage stats) (get coverage-amount policy))
+      }
+    stats
+  )
+)
+
+(define-private (calculate-bundle-discount (num-policies uint))
+  (if (<= num-policies u2)
+    u5
+    (if (<= num-policies u4)
+      u10
+      (if (<= num-policies u7)
+        u15
+        u20
+      )
+    )
+  )
+)
+
+(define-private (update-user-bundles (user principal) (bundle-id uint))
+  (let
+    (
+      (current-bundles (default-to { bundle-ids: (list) } (map-get? user-bundles { user: user })))
+      (current-list (get bundle-ids current-bundles))
+    )
+    (map-set user-bundles
+      { user: user }
+      { bundle-ids: (unwrap-panic (as-max-len? (append current-list bundle-id) u20)) }
+    )
+  )
+)
+
+(define-read-only (get-policy-bundle (bundle-id uint))
+  (map-get? policy-bundles { bundle-id: bundle-id })
+)
+
+(define-read-only (get-user-bundles (user principal))
+  (map-get? user-bundles { user: user })
+)
+
+(define-read-only (calculate-bundle-savings (policy-ids (list 10 uint)))
+  (let
+    (
+      (num-policies (len policy-ids))
+      (bundle-stats (calculate-bundle-stats policy-ids))
+      (discount-percent (calculate-bundle-discount num-policies))
+      (discount-amount (/ (* (get total-premium bundle-stats) discount-percent) u100))
+    )
+    (ok {
+      original-premium: (get total-premium bundle-stats),
+      discount-percent: discount-percent,
+      discount-amount: discount-amount,
+      final-premium: (- (get total-premium bundle-stats) discount-amount),
+      total-coverage: (get total-coverage bundle-stats)
+    })
+  )
+)
+
+(define-read-only (get-bundle-summary (bundle-id uint))
+  (match (map-get? policy-bundles { bundle-id: bundle-id })
+    bundle
+      (ok {
+        owner: (get owner bundle),
+        num-policies: (len (get policy-ids bundle)),
+        total-premium: (get total-premium bundle),
+        total-coverage: (get total-coverage bundle),
+        savings: (get bundle-discount bundle),
+        active: (get active bundle),
+        bundle-name: (get bundle-name bundle)
+      })
+    ERR-BUNDLE-NOT-FOUND
+  )
+)
+
+(define-read-only (get-user-bundle-stats (user principal))
+  (match (map-get? user-bundles { user: user })
+    bundles
+      (ok {
+        total-bundles: (len (get bundle-ids bundles)),
+        bundle-ids: (get bundle-ids bundles)
+      })
+    (ok { total-bundles: u0, bundle-ids: (list) })
   )
 )
